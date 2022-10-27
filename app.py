@@ -9,7 +9,9 @@ from io import BytesIO
 import pandas as pd
 import cv2
 
-from back import read_prescription
+_aws_lambda = True
+if not _aws_lambda:
+    from back import read_prescription
 
 _MAX_SIZE = 2048
 
@@ -136,15 +138,23 @@ async def put(session, url, img_base64, bck_type, **kwargs):
 def process_image(url, image, img_display, values_display, title_values, transposed_values_display,
                   title_transposed_values, others_display):
     img_base64 = pil_image_to_b64str(image)
-    # headers, payload = make_payload(img_base64)
-    # response = requests.put(url, headers=headers, data=payload)
-    # data_dict = response.json()
-    data_dict, output_img, graphics_output = read_prescription(img_base64)
-    data_dict = json.loads(data_dict)
-    output_img = json.loads(output_img)
-    graphics_output = json.loads(graphics_output)
+
+    if _aws_lambda:
+        headers, payload = make_payload(img_base64)
+        response = requests.put(url + "/run", headers=headers, data=payload)
+        json_data = response.json()
+        output_img = json_data[0]['data']
+        graphics_output = json_data[1]['data']
+        data_dict = json_data[2]['data']
+    else:
+        data_dict, output_img, graphics_output = read_prescription(img_base64)
+        data_dict = json.loads(data_dict)
+        output_img = json.loads(output_img)
+        graphics_output = json.loads(graphics_output)
+
     output_img = b64str_to_numpy(output_img["image"])
     output_img = np.array(output_img[:, :, ::-1], dtype='uint8')
+
     for rect in graphics_output["items"]:
         x, y, w, h = rect["x"], rect["y"], rect["width"], rect["height"]
         pen_prop = rect["properties"]["pen"]
@@ -152,6 +162,7 @@ def process_image(url, image, img_display, values_display, title_values, transpo
         pt1 = [int(x), int(y)]
         pt2 = [int(x + w), int(y + h)]
         cv2.rectangle(output_img, pt1, pt2, color, 3)
+
     # Update image in streamlit view
     display_result(data_dict, output_img, graphics_output, img_display, values_display, title_values,
                    transposed_values_display,
@@ -190,7 +201,7 @@ def demo():
         # Local invocation
         # url = "http://localhost:9000/2015-03-31/functions/function/invocations"
         # AWS Lambda invocation
-        url = "https://psjzth8q2l.execute-api.eu-west-1.amazonaws.com/"
+        url = "https://4p33js6md5.execute-api.eu-west-3.amazonaws.com/"
         process_image(url, input_img, img_display, values_display, title_values, transposed_values_display,
                       title_transposed_values, others_display)
     else:
