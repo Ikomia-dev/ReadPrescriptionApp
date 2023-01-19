@@ -8,6 +8,13 @@ from PIL import Image
 from io import BytesIO
 import pandas as pd
 import cv2
+from yarl import URL
+import logging
+import time
+
+
+logger = logging.getLogger(__name__)
+
 
 _aws_lambda = True
 if not _aws_lambda:
@@ -20,6 +27,89 @@ if "run_workflow" not in st.session_state:
 
 if "result_img" not in st.session_state:
     st.session_state.result_img = None
+
+if "jwt" not in st.session_state:
+    st.session_state.jwt = None
+
+
+# Ikomia Scale URL
+IKSCALE_URL=URL("https://scale.ikomia.net")
+
+# Ikomia Scale project ID
+PROJECT_ID="0185c004-b8a8-4758-a517-2e7e37f8defe"
+
+# Ikomia Scale project deployment endpoint
+ENDPOINT_URL = "https://agq56k3hgj.execute-api.eu-west-3.amazonaws.com"
+
+
+class HTTPBadCodeError(Exception):
+    """Raised when request status code <200 or >299."""
+
+    def __init__(self, url: URL, code: int, content=None):
+        """
+        Init a new HTTP error.
+
+        Args:
+            url: URL
+            code: HTTP code
+            headers: Response header
+            content: Response content
+        """
+        super().__init__(f"Bad return code {code} on '{url}'")
+        self.url = url
+        self.code = code
+        self.content = content
+
+
+def request(session, headers, method, url, data=None):
+
+    if data is not None:
+        data = json.dumps(data)
+
+    request = requests.Request(
+        method=method,
+        url=url,
+        headers=headers,
+        #            params=query,
+        data=data,
+    )
+    prepared_request = session.prepare_request(request)
+
+    # Produce some debug logs
+    logger.debug("Will %s '%s'", prepared_request.method, prepared_request.url)
+    if prepared_request.headers:
+        logger.debug(" with headers : %s", prepared_request.headers)
+    if prepared_request.body:
+        if len(prepared_request.body) > 10240:
+            logger.debug(" with body    : .... too long to be dumped ! ...")
+        else:
+            logger.debug(" with body    : %s", prepared_request.body)
+
+    try:
+        response = session.send(
+            prepared_request,
+            allow_redirects=False,
+            timeout=(30, 30),
+        )
+    except requests.exceptions.ReadTimeout as e:
+        return None
+
+    logger.debug("Response code : %d", response.status_code)
+    logger.debug(" with headers : %s", response.headers)
+    if ("Content-Length" in response.headers and int(response.headers["Content-Length"]) > 10240) or len(
+        response.content
+    ) > 10240:
+        logger.debug(" with content    : .... too long to be dumped ! ...")
+    else:
+        logger.debug(" with content    : %s", response.content)
+
+    if response.status_code >= 200 and response.status_code <= 299:
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return response.content
+
+    raise HTTPBadCodeError(url, response.status_code, response.content)
 
 
 def on_input_change():
@@ -78,9 +168,7 @@ def make_payload(img_base64):
     headers = {"Content-Type": "application/json"}
 
     body = {
-        "inputs": [
-            {"type": "IMAGE", "data": img_base64},
-        ],
+        "inputs": [{"image": img_base64}],
         "outputs": [
             {"task_name": "read_eye_prescription", "task_index": 0, "output_index": 0},
             {"task_name": "read_eye_prescription", "task_index": 0, "output_index": 1},
@@ -90,8 +178,9 @@ def make_payload(img_base64):
         "isBase64Encoded": True
     }
 
-    payload = json.dumps(body)
-    return headers, payload
+    #payload = json.dumps(body)
+    #return headers, payload
+    return body
 
 
 def colorize_rows(s):
@@ -128,31 +217,54 @@ def display_result(results, output_img, graphics_output, img_display, values_dis
     others_display.markdown(str_to_write)
 
 
-async def put(session, url, img_base64, bck_type, **kwargs):
-    headers, payload = make_payload(img_base64, bck_type)
-    response = await session.request('PUT', url=url, headers=headers, data=payload, **kwargs)
-    data = await response.json(content_type=None)
-    return data
+def do(api_url, jwt, image):
+    url = URL(api_url)
+
+    session = requests.Session()
+    headers = {
+        "User-Agent": "IkomiaCli",
+        "Authorization": f"Bearer {jwt}",
+    }
+
+    # Run workflow
+    #response = request(session, headers, "PUT", url / "api/run", data=payload(task, task_parameters, image))
+    response = request(session, headers, "PUT", url / "api/run", data=make_payload(image))
+
+    # Get results
+    uuid = response
+
+    response = None
+
+    while response is None or len(response) == 0:
+        response = request(session, headers, "GET", url / f"api/results/{uuid}")
+        time.sleep(5)
+
+    return response
 
 
-def process_image(url, image, img_display, values_display, title_values, transposed_values_display,
+def process_image(url, jwt, image, img_display, values_display, title_values, transposed_values_display,
                   title_transposed_values, others_display):
     img_base64 = pil_image_to_b64str(image)
 
     if _aws_lambda:
-        headers, payload = make_payload(img_base64)
-        response = requests.put(url + "/run", headers=headers, data=payload)
-        json_data = response.json()
-        output_img = json_data[0]['data']
-        graphics_output = json_data[1]['data']
-        data_dict = json_data[2]['data']
+        json_data = do(url, jwt, img_base64)
+        for line in json_data:
+            (t, d) = next(iter(line.items()))
+            if t == "image":
+                output_img = d
+            elif t == "OUTPUT_GRAPHICS":
+                graphics_output = d
+            elif t == "DATA_DICT":
+                data_dict = d
+            else:
+                raise ValueError(f"Can't parse {t} in response")
     else:
         data_dict, output_img, graphics_output = read_prescription(img_base64)
         data_dict = json.loads(data_dict)
-        output_img = json.loads(output_img)
+        output_img = json.loads(output_img)["image"]
         graphics_output = json.loads(graphics_output)
 
-    output_img = b64str_to_numpy(output_img["image"])
+    output_img = b64str_to_numpy(output_img)
     output_img = np.array(output_img[:, :, ::-1], dtype='uint8')
 
     for rect in graphics_output["items"]:
@@ -169,11 +281,47 @@ def process_image(url, image, img_display, values_display, title_values, transpo
                    title_transposed_values, others_display)
 
 
-def demo():
-    st.set_page_config(layout="wide")
+def get_jwt(api_token, project_id):
 
-    # Sidebar
-    st.sidebar.image("./images/ikomia_logo_400x400.png", use_column_width=True)
+    if st.session_state.jwt is None:
+        session = requests.Session()
+        headers = {
+            "User-Agent": "IkomiaStreamlit",
+            "Authorization": f"Token {api_token}",
+        }
+
+        response = request(session, headers, "GET", IKSCALE_URL / f"v1/projects/{project_id}/jwt/")
+
+        if "id_token" in response:
+            st.session_state.jwt = response["id_token"]
+        else:
+            raise Exception("Can't parse response {response}")
+
+    return st.session_state.jwt
+
+
+def demo():
+
+    st.set_page_config(
+        page_title="Ophthalmology Prescription Reader",
+        page_icon="./images/ikomia_logo_400x400.png",
+        layout="wide",
+        initial_sidebar_state="expanded",
+        menu_items={
+            "Get Help": "https://www.ikomia.com",
+            "About": f"This is 'Ophthalmology Prescription Reader' workflow",
+        },
+    )
+
+    #
+    #   Sidebar
+    #
+    st.sidebar.image("./images/ikomia_logo_400x400.png", width=100)
+
+    api_token = st.sidebar.text_input("API Token")
+    with st.sidebar.expander("API", expanded=False):
+        project_id = st.text_input("Ikomia Project ID", value=PROJECT_ID)
+        endpoint_url = st.text_input("API Endpoint URL", value=ENDPOINT_URL)
 
     # Title
     st.title("Ophthalmology Prescription Reader")
@@ -198,12 +346,18 @@ def demo():
         return
 
     if st.session_state.run_workflow:
-        # Local invocation
-        # url = "http://localhost:9000/2015-03-31/functions/function/invocations"
-        # AWS Lambda invocation
-        url = "https://4p33js6md5.execute-api.eu-west-3.amazonaws.com/"
-        process_image(url, input_img, img_display, values_display, title_values, transposed_values_display,
-                      title_transposed_values, others_display)
+        # Get JWT from ikscale
+        jwt = get_jwt(api_token, project_id)
+
+        # Deployment Endpoint invocation
+        with st.spinner("Wait for results..."):
+            try:
+                process_image(endpoint_url, jwt, input_img, img_display, values_display, title_values, transposed_values_display,
+                              title_transposed_values, others_display)
+            except HTTPBadCodeError as e:
+                if e.code == 307:  # Temporary redirect to log in
+                    st.session_state.jwt = None  # Purge stored JWT
+                raise
     else:
         display_result(st.session_state.result_img, img_display, values_display, title_values,
                        transposed_values_display,
