@@ -39,7 +39,7 @@ IKSCALE_URL=URL("https://scale.ikomia.net")
 PROJECT_ID="0185c004-b8a8-4758-a517-2e7e37f8defe"
 
 # Ikomia Scale project deployment endpoint
-ENDPOINT_URL = "https://agq56k3hgj.execute-api.eu-west-3.amazonaws.com"
+ENDPOINT_URL = "https://583wuyhtl3.execute-api.eu-west-3.amazonaws.com"
 
 
 class HTTPBadCodeError(Exception):
